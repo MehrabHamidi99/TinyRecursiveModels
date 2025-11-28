@@ -15,6 +15,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/06/a2/8ef8f0bb022f39d87edda9e04e77458195eb0011d13561c4e7a85e6c1c22/adam_atan2-0.0.3.tar.gz", hash = "sha256:f07faef4a6d7476ad3be6096155a35a5ecf6a3932282367f05d45158b81ff5a8", size = 11991, upload-time = "2025-04-02T02:15:07.501Z" }
 
 [[package]]
+name = "adam-atan2-pytorch"
+version = "0.2.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/15/e5/baca620dc661a49ba4df23b7ebc22017f7aca6d99614919e66a43df5160f/adam_atan2_pytorch-0.2.4.tar.gz", hash = "sha256:8cb459092ff82b86318bcb6dfb4ac9a7ea6d371f5b69e687900d0afd7fc2cab1", size = 422244, upload-time = "2025-10-15T21:27:09.592Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f5/a2/aaf53660cd0c4a84bb22a0352d98ac72f4fe4d1360543aad3c2de39c22fa/adam_atan2_pytorch-0.2.4-py3-none-any.whl", hash = "sha256:404d1c5ba331633a6f6e395891ed28cb13a7cf622ac824ba9913b8286ad97e99", size = 15032, upload-time = "2025-10-15T21:27:08.746Z" },
+]
+
+[[package]]
 name = "annotated-types"
 version = "0.7.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1052,9 +1064,10 @@ wheels = [
 [[package]]
 name = "tinyrecursivemodels"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "adam-atan2" },
+    { name = "adam-atan2-pytorch" },
     { name = "argdantic" },
     { name = "coolname" },
     { name = "einops" },
@@ -1078,6 +1091,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "adam-atan2", specifier = ">=0.0.3" },
+    { name = "adam-atan2-pytorch", specifier = ">=0.2.4" },
     { name = "argdantic", specifier = ">=1.3.3" },
     { name = "coolname", specifier = ">=2.2.0" },
     { name = "einops", specifier = ">=0.8.1" },

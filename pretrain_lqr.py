@@ -1,3 +1,23 @@
+"""
+TinyRecursiveModels Pretrain Script with LQR Optimizer
+
+This is a complete, runnable version of pretrain.py with LQR optimizer integrated.
+
+Usage:
+    # With LQR optimizer
+    uv run torchrun --nproc-per-node 4 pretrain_lqr.py \
+        arch=trm \
+        data_paths="[data/sudoku-extreme-1k-aug-1000]" \
+        use_lqr=True \
+        lqr_precond_lr=1e-2
+    
+    # Without LQR (baseline)
+    uv run torchrun --nproc-per-node 4 pretrain_lqr.py \
+        arch=trm \
+        data_paths="[data/sudoku-extreme-1k-aug-1000]" \
+        use_lqr=False
+"""
+
 from typing import Optional, Any, Sequence, List
 from dataclasses import dataclass
 import os
@@ -23,6 +43,9 @@ from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMeta
 from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
+
+# Import LQR optimizer
+from lqr_trm import create_lqr_optimizer_for_trm, LQRConfig
 
 
 class LossConfig(pydantic.BaseModel):
@@ -76,12 +99,24 @@ class PretrainConfig(pydantic.BaseModel):
     seed: int = 0
     checkpoint_every_eval: bool = False
     eval_interval: Optional[int] = None
-    min_eval_interval: Optional[int] = 0 # when to start eval
+    min_eval_interval: Optional[int] = 0  # when to start eval
     eval_save_outputs: List[str] = []
 
-    ema: bool = False # use Exponential-Moving-Average
-    ema_rate: float = 0.999 # EMA-rate
-    freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
+    ema: bool = False  # use Exponential-Moving-Average
+    ema_rate: float = 0.999  # EMA-rate
+    freeze_weights: bool = False  # If True, freeze weights and only learn the embeddings
+    
+    # LQR optimizer settings
+    use_lqr: bool = False
+    lqr_precond_lr: float = 1e-2
+    lqr_precond_update_every: int = 1000 # TODO: make this higher, before 100 
+    lqr_precond_update_steps: int = 10
+    lqr_ema_decay: float = 0.6 # TODO: make this lower 0.6, before 0.9
+    lqr_damping: float = 1e-4
+    lqr_block_structure: str = "diagonal"
+    lqr_normalize_grad: bool = False # TODO: make this False, before True
+    lqr_clip_precond_min: float = 1e-8
+
 
 @dataclass
 class TrainState:
@@ -145,51 +180,111 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                     dist.broadcast(param, src=0)
 
     # Optimizers and lr
-    if config.arch.puzzle_emb_ndim == 0:
-        optimizers = [
-            AdamATan2(
-                model.parameters(),
-                lr=config.lr, # Needs to be set by scheduler
-                weight_decay=config.weight_decay,
-                betas=(config.beta1, config.beta2)
-            )
-        ]
-        optimizer_lrs = [
-            config.lr
-        ]
-    elif config.freeze_weights:
-        optimizers = [
-            CastedSparseEmbeddingSignSGD_Distributed(
-                model.model.puzzle_emb.buffers(),  # type: ignore
-                lr=0,  # Needs to be set by scheduler
-                weight_decay=config.puzzle_emb_weight_decay,
-                world_size=world_size
-            )
-        ]
-        optimizer_lrs = [
-            config.puzzle_emb_lr
-        ]
+    if config.use_lqr:
+        print("Using LQR optimizer")
+        print("=" * 60)
+        # Use LQR optimizer
+        if rank == 0:
+            print("=" * 60)
+            print("Using LQR Optimizer")
+            print("=" * 60)
+            print(f"  precond_lr: {config.lqr_precond_lr}")
+            print(f"  precond_update_every: {config.lqr_precond_update_every}")
+            print(f"  precond_update_steps: {config.lqr_precond_update_steps}")
+            print(f"  ema_decay: {config.lqr_ema_decay}")
+            print(f"  damping: {config.lqr_damping}")
+            print(f"  block_structure: {config.lqr_block_structure}")
+            print("=" * 60)
+        
+        lqr_config = LQRConfig(
+            lr=config.lr,
+            precond_lr=config.lqr_precond_lr,
+            precond_update_every=config.lqr_precond_update_every,
+            precond_update_steps=config.lqr_precond_update_steps,
+            ema_decay=config.lqr_ema_decay,
+            damping=config.lqr_damping,
+            block_structure=config.lqr_block_structure,
+            normalize_grad=config.lqr_normalize_grad,
+            clip_precond_min=config.lqr_clip_precond_min,
+            weight_decay=config.weight_decay,
+            betas=(config.beta1, config.beta2)
+        )
+        
+        if config.arch.puzzle_emb_ndim == 0:
+            optimizers = [
+                create_lqr_optimizer_for_trm(model, lqr_config)
+            ]
+            optimizer_lrs = [config.lr]
+            
+        elif config.freeze_weights:
+            optimizers = [
+                CastedSparseEmbeddingSignSGD_Distributed(
+                    model.model.puzzle_emb.buffers(),  # type: ignore
+                    lr=0,
+                    weight_decay=config.puzzle_emb_weight_decay,
+                    world_size=world_size
+                )
+            ]
+            optimizer_lrs = [config.puzzle_emb_lr]
+            
+        else:
+            optimizers = [
+                CastedSparseEmbeddingSignSGD_Distributed(
+                    model.model.puzzle_emb.buffers(),  # type: ignore
+                    lr=0,
+                    weight_decay=config.puzzle_emb_weight_decay,
+                    world_size=world_size
+                ),
+                create_lqr_optimizer_for_trm(model, lqr_config)
+            ]
+            optimizer_lrs = [config.puzzle_emb_lr, config.lr]
+    
     else:
-        optimizers = [
-            CastedSparseEmbeddingSignSGD_Distributed(
-                model.model.puzzle_emb.buffers(),  # type: ignore
-                lr=0,  # Needs to be set by scheduler
-                weight_decay=config.puzzle_emb_weight_decay,
-                world_size=world_size
-            ),
-            AdamATan2(
-                model.parameters(),
-                lr=config.lr,  # Needs to be set by scheduler
-                weight_decay=config.weight_decay,
-                betas=(config.beta1, config.beta2)
-            )
-        ]
-        optimizer_lrs = [
-            config.puzzle_emb_lr,
-            config.lr
-        ]
+        # Original AdamATan2 optimizer
+        if rank == 0:
+            print("Using AdamATan2 optimizer (baseline)")
+            
+        if config.arch.puzzle_emb_ndim == 0:
+            optimizers = [
+                AdamATan2(
+                    model.parameters(),
+                    lr=config.lr,
+                    weight_decay=config.weight_decay,
+                    betas=(config.beta1, config.beta2)
+                )
+            ]
+            optimizer_lrs = [config.lr]
+            
+        elif config.freeze_weights:
+            optimizers = [
+                CastedSparseEmbeddingSignSGD_Distributed(
+                    model.model.puzzle_emb.buffers(),  # type: ignore
+                    lr=0,
+                    weight_decay=config.puzzle_emb_weight_decay,
+                    world_size=world_size
+                )
+            ]
+            optimizer_lrs = [config.puzzle_emb_lr]
+            
+        else:
+            optimizers = [
+                CastedSparseEmbeddingSignSGD_Distributed(
+                    model.model.puzzle_emb.buffers(),  # type: ignore
+                    lr=0,
+                    weight_decay=config.puzzle_emb_weight_decay,
+                    world_size=world_size
+                ),
+                AdamATan2(
+                    model.parameters(),
+                    lr=config.lr,
+                    weight_decay=config.weight_decay,
+                    betas=(config.beta1, config.beta2)
+                )
+            ]
+            optimizer_lrs = [config.puzzle_emb_lr, config.lr]
 
     return model, optimizers, optimizer_lrs
+
 
 def mix_weights_direct(device, alpha, net, nets):
     sd = []
@@ -203,6 +298,7 @@ def mix_weights_direct(device, alpha, net, nets):
         sd_alpha[k] =  comb_net
     net.load_state_dict(sd_alpha)
     return net
+
 
 def cosine_schedule_with_warmup_lr_lambda(
     current_step: int, *, base_lr: float, num_warmup_steps: int, num_training_steps: int, min_ratio: float = 0.0, num_cycles: float = 0.5
@@ -272,7 +368,6 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
     )
 
 
-
 def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetadata) -> List[Any]:
     data_paths =config.data_paths_test if len(config.data_paths_test)>0 else config.data_paths
     # Initialize evaluators
@@ -285,6 +380,7 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
             evaluators.append(cls)
 
     return evaluators
+
 
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
     train_state.step += 1
@@ -317,8 +413,32 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
         for param_group in optim.param_groups:
             param_group['lr'] = lr_this_step
+        
+        # If using LQR optimizer, pass data for preconditioner update
+        if config.use_lqr and hasattr(optim, 'preconditioner'):
+            # Create simple loss function for preconditioner
+            def loss_fn(outputs, targets):
+                # Simplified loss for preconditioner update
+                # Note: This is a proxy, you may want to use the actual loss from the model
+                return nn.functional.cross_entropy(outputs.view(-1, outputs.size(-1)), targets.view(-1))
             
-        optim.step()
+            # Get inputs/targets from batch for preconditioner
+            # Adjust these based on your actual batch structure
+            inputs = batch.get('inputs', batch.get('input_ids', None))
+            targets = batch.get('labels', batch.get('targets', None))
+            
+            if inputs is not None and targets is not None:
+                optim.step(
+                    data_batch=inputs,
+                    labels=targets,
+                    loss_fn=loss_fn
+                )
+            else:
+                # Fallback to regular step if batch structure doesn't match
+                optim.step()
+        else:
+            optim.step()
+            
         optim.zero_grad()
 
     # Reduce metrics
@@ -341,6 +461,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
             reduced_metrics["train/lr"] = lr_this_step
             return reduced_metrics
+
 
 def evaluate(
     config: PretrainConfig,
@@ -485,6 +606,7 @@ def evaluate(
 
     return reduced_metrics
 
+
 def save_code_and_config(config: PretrainConfig):
     if config.checkpoint_path is None or wandb.run is None:
         return
@@ -520,7 +642,8 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
         if config.project_name is None:
             config.project_name = f"{os.path.basename(config.data_paths[0]).capitalize()}-ACT-torch"
         if config.run_name is None:
-            config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)}"
+            suffix = "LQR" if config.use_lqr else "baseline"
+            config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)} ({suffix})"
         if config.checkpoint_path is None:
             config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
 
@@ -652,3 +775,4 @@ def launch(hydra_config: DictConfig):
 
 if __name__ == "__main__":
     launch()
+

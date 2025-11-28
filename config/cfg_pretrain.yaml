@@ -40,3 +40,14 @@ min_eval_interval: 0 # when to start the eval
 ema: False # use Exponential-Moving-Average
 ema_rate: 0.999 # EMA-rate
 freeze_weights: False # If True, freeze weights and only learn the embeddings
+
+# LQR Optimizer Settings
+use_lqr: false  # Set to true to enable LQR optimizer
+lqr_precond_lr: 1e-2  # Learning rate for preconditioner updates
+lqr_precond_update_every: 100  # Update preconditioner every N steps
+lqr_precond_update_steps: 10  # Number of gradient steps per preconditioner update
+lqr_ema_decay: 0.9  # EMA decay for preconditioner smoothing
+lqr_damping: 1e-4  # Damping for numerical stability
+lqr_block_structure: "diagonal"  # Block structure: "diagonal" or "scalar"
+lqr_normalize_grad: true  # Normalize gradients before preconditioner update
+lqr_clip_precond_min: 1e-8  # Minimum preconditioner value (prevents gradient inversion)
