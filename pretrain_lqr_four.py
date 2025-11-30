@@ -1,21 +1,40 @@
 """
-TinyRecursiveModels Pretrain Script with LQR Optimizer
+TinyRecursiveModels Pretrain Script with Four Optimizer Options
 
-This is a complete, runnable version of pretrain.py with LQR optimizer integrated.
+This script supports four different training paradigms:
+1. AdamATan2 - Regular Adam with atan2-based update
+2. SGD - Stochastic Gradient Descent with momentum
+3. LQR+Adam - LQR preconditioner wrapped around Adam
+4. LQR+SGD - LQR preconditioner wrapped around SGD
 
 Usage:
-    # With LQR optimizer
-    uv run torchrun --nproc-per-node 4 pretrain_lqr.py \
+    # With AdamATan2 optimizer (default)
+    uv run torchrun --nproc-per-node 4 pretrain_lqr_four.py \
         arch=trm \
         data_paths="[data/sudoku-extreme-1k-aug-1000]" \
-        use_lqr=True \
+        optimizer_type=adam
+    
+    # With SGD optimizer
+    uv run torchrun --nproc-per-node 4 pretrain_lqr_four.py \
+        arch=trm \
+        data_paths="[data/sudoku-extreme-1k-aug-1000]" \
+        optimizer_type=sgd \
+        sgd_momentum=0.9
+    
+    # With LQR+Adam optimizer
+    uv run torchrun --nproc-per-node 4 pretrain_lqr_four.py \
+        arch=trm \
+        data_paths="[data/sudoku-extreme-1k-aug-1000]" \
+        optimizer_type=lqr_adam \
         lqr_precond_lr=1e-2
     
-    # Without LQR (baseline)
-    uv run torchrun --nproc-per-node 4 pretrain_lqr.py \
+    # With LQR+SGD optimizer
+    uv run torchrun --nproc-per-node 4 pretrain_lqr_four.py \
         arch=trm \
         data_paths="[data/sudoku-extreme-1k-aug-1000]" \
-        use_lqr=False
+        optimizer_type=lqr_sgd \
+        lqr_precond_lr=1e-2 \
+        sgd_momentum=0.9
 """
 
 from typing import Optional, Any, Sequence, List
@@ -44,8 +63,12 @@ from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 
-# Import LQR optimizer
-from lqr_trm import create_lqr_optimizer_for_trm, LQRConfig
+# Import LQR optimizers
+from lqr_trm import (
+    create_lqr_adam_optimizer_for_trm,
+    create_lqr_sgd_optimizer_for_trm,
+    LQRConfig
+)
 
 
 class LossConfig(pydantic.BaseModel):
@@ -106,15 +129,20 @@ class PretrainConfig(pydantic.BaseModel):
     ema_rate: float = 0.999  # EMA-rate
     freeze_weights: bool = False  # If True, freeze weights and only learn the embeddings
     
-    # LQR optimizer settings
-    use_lqr: bool = False
+    # Optimizer type: "adam", "sgd", "lqr_adam", "lqr_sgd"
+    optimizer_type: str = "adam"
+    
+    # SGD specific settings
+    sgd_momentum: float = 0.9
+    
+    # LQR optimizer settings (used for lqr_adam and lqr_sgd)
     lqr_precond_lr: float = 1e-2
-    lqr_precond_update_every: int = 1000 # TODO: make this higher, before 100 
+    lqr_precond_update_every: int = 1000
     lqr_precond_update_steps: int = 10
-    lqr_ema_decay: float = 0.6 # TODO: make this lower 0.6, before 0.9
+    lqr_ema_decay: float = 0.6
     lqr_damping: float = 1e-4
     lqr_block_structure: str = "diagonal"
-    lqr_normalize_grad: bool = False # TODO: make this False, before True
+    lqr_normalize_grad: bool = False
     lqr_clip_precond_min: float = 1e-8
 
 
@@ -180,19 +208,36 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                     dist.broadcast(param, src=0)
 
     # Optimizers and lr
-    if config.use_lqr:
-        if rank == 0:
-            print("=" * 60)
-            print("Using LQR Optimizer")
-            print("=" * 60)
+    optimizer_type = config.optimizer_type.lower()
+    
+    if rank == 0:
+        print("=" * 60)
+        print(f"Using Optimizer: {optimizer_type.upper()}")
+        print("=" * 60)
+        if optimizer_type == "adam":
+            print(f"  lr: {config.lr}")
+            print(f"  betas: ({config.beta1}, {config.beta2})")
+            print(f"  weight_decay: {config.weight_decay}")
+        elif optimizer_type == "sgd":
+            print(f"  lr: {config.lr}")
+            print(f"  momentum: {config.sgd_momentum}")
+            print(f"  weight_decay: {config.weight_decay}")
+        elif optimizer_type in ("lqr_adam", "lqr_sgd"):
+            print(f"  base_optimizer: {'Adam' if optimizer_type == 'lqr_adam' else 'SGD'}")
+            print(f"  lr: {config.lr}")
             print(f"  precond_lr: {config.lqr_precond_lr}")
             print(f"  precond_update_every: {config.lqr_precond_update_every}")
             print(f"  precond_update_steps: {config.lqr_precond_update_steps}")
             print(f"  ema_decay: {config.lqr_ema_decay}")
             print(f"  damping: {config.lqr_damping}")
             print(f"  block_structure: {config.lqr_block_structure}")
-            print("=" * 60)
-        
+            if optimizer_type == "lqr_sgd":
+                print(f"  momentum: {config.sgd_momentum}")
+        print("=" * 60)
+    
+    # Create LQR config if needed
+    lqr_config = None
+    if optimizer_type in ("lqr_adam", "lqr_sgd"):
         lqr_config = LQRConfig(
             lr=config.lr,
             precond_lr=config.lqr_precond_lr,
@@ -206,37 +251,66 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             weight_decay=config.weight_decay,
             betas=(config.beta1, config.beta2)
         )
-        
-        if config.arch.puzzle_emb_ndim == 0:
-            print("Using LQR optimizer for puzzle embedding")
-            optimizers = [
-                create_lqr_optimizer_for_trm(model, lqr_config)
-            ]
-            optimizer_lrs = [config.lr]
-            
-        elif config.freeze_weights:
-            optimizers = [
-                CastedSparseEmbeddingSignSGD_Distributed(
-                    model.model.puzzle_emb.buffers(),  # type: ignore
-                    lr=0,
-                    weight_decay=config.puzzle_emb_weight_decay,
-                    world_size=world_size
-                )
-            ]
-            optimizer_lrs = [config.puzzle_emb_lr]
-            
+    
+    def create_main_optimizer(model):
+        """Create the main optimizer based on optimizer_type"""
+        if optimizer_type == "adam":
+            return AdamATan2(
+                model.parameters(),
+                lr=config.lr,
+                betas=(config.beta1, config.beta2),
+                weight_decay=config.weight_decay
+            )
+        elif optimizer_type == "sgd":
+            return torch.optim.SGD(
+                model.parameters(),
+                lr=config.lr,
+                momentum=config.sgd_momentum,
+                weight_decay=config.weight_decay
+            )
+        elif optimizer_type == "lqr_adam":
+            return create_lqr_adam_optimizer_for_trm(model, lqr_config)
+        elif optimizer_type == "lqr_sgd":
+            return create_lqr_sgd_optimizer_for_trm(model, lqr_config, momentum=config.sgd_momentum)
         else:
-            print("Using LQR optimizer for model parameters")
-            optimizers = [
-                CastedSparseEmbeddingSignSGD_Distributed(
-                    model.model.puzzle_emb.buffers(),  # type: ignore
-                    lr=0,
-                    weight_decay=config.puzzle_emb_weight_decay,
-                    world_size=world_size
-                ),
-                create_lqr_optimizer_for_trm(model, lqr_config)
-            ]
-            optimizer_lrs = [config.puzzle_emb_lr, config.lr]
+            raise ValueError(f"Unknown optimizer type: {optimizer_type}. "
+                           f"Choose from: adam, sgd, lqr_adam, lqr_sgd")
+    
+    if config.arch.puzzle_emb_ndim == 0:
+        # No puzzle embedding, just use main optimizer
+        if rank == 0:
+            print(f"Using {optimizer_type} optimizer (no puzzle embedding)")
+        optimizers = [create_main_optimizer(model)]
+        optimizer_lrs = [config.lr]
+        
+    elif config.freeze_weights:
+        # Only train puzzle embeddings
+        if rank == 0:
+            print("Freezing model weights, only training puzzle embeddings")
+        optimizers = [
+            CastedSparseEmbeddingSignSGD_Distributed(
+                model.model.puzzle_emb.buffers(),  # type: ignore
+                lr=0,
+                weight_decay=config.puzzle_emb_weight_decay,
+                world_size=world_size
+            )
+        ]
+        optimizer_lrs = [config.puzzle_emb_lr]
+        
+    else:
+        # Train both puzzle embeddings and model parameters
+        if rank == 0:
+            print(f"Using {optimizer_type} optimizer for model parameters + SignSGD for puzzle embeddings")
+        optimizers = [
+            CastedSparseEmbeddingSignSGD_Distributed(
+                model.model.puzzle_emb.buffers(),  # type: ignore
+                lr=0,
+                weight_decay=config.puzzle_emb_weight_decay,
+                world_size=world_size
+            ),
+            create_main_optimizer(model)
+        ]
+        optimizer_lrs = [config.puzzle_emb_lr, config.lr]
     
     return model, optimizers, optimizer_lrs
 
@@ -363,6 +437,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             
     # Apply optimizer
     lr_this_step = None    
+    is_lqr_optimizer = config.optimizer_type.lower() in ("lqr_adam", "lqr_sgd")
+    
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
         lr_this_step = compute_lr(base_lr, config, train_state)
 
@@ -370,7 +446,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             param_group['lr'] = lr_this_step
         
         # If using LQR optimizer, pass data for preconditioner update
-        if config.use_lqr and hasattr(optim, 'preconditioner'):
+        if is_lqr_optimizer and hasattr(optim, 'preconditioner'):
             # Create simple loss function for preconditioner
             def loss_fn(outputs, targets):
                 # Simplified loss for preconditioner update
@@ -597,7 +673,7 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
         if config.project_name is None:
             config.project_name = f"{os.path.basename(config.data_paths[0]).capitalize()}-ACT-torch"
         if config.run_name is None:
-            suffix = "LQR" if config.use_lqr else "baseline"
+            suffix = config.optimizer_type.upper()
             config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)} ({suffix})"
         if config.checkpoint_path is None:
             config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)

@@ -3,3 +3,5 @@ checkpoints/
 data
 wandb
 outputs
+*.out
+*.sh

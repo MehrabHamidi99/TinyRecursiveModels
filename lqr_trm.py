@@ -319,7 +319,169 @@ class LQRAdamOptimizer(Optimizer):
         return loss
 
 
+class LQRSGDOptimizer(Optimizer):
+    """
+    Combined LQR preconditioner + SGD optimizer.
+    
+    This wraps a standard SGD optimizer with LQR-inspired preconditioning.
+    """
+    
+    def __init__(self, params, model: nn.Module, config: LQRConfig, momentum: float = 0.9):
+        self.config = config
+        self.model = model
+        self.momentum = momentum
+        
+        # Create preconditioner
+        self.preconditioner = DiagonalPreconditioner(model, config)
+        
+        # Base optimizer (SGD)
+        defaults = dict(
+            lr=config.lr,
+            momentum=momentum,
+            weight_decay=config.weight_decay
+        )
+        super().__init__(params, defaults)
+        
+        # Track steps for preconditioner updates
+        self.step_count = 0
+    
+    @torch.no_grad()
+    def step(self, closure=None, data_batch=None, labels=None, loss_fn=None, carry=None):
+        """
+        Performs a single optimization step.
+        
+        Args:
+            closure: Optional closure that reevaluates the model
+            data_batch: Batch data for preconditioner update (not used for TRM)
+            labels: Labels for preconditioner update (not used for TRM)
+            loss_fn: Loss function for preconditioner update (not used for TRM)
+            carry: Carry state for TRM models (not used for TRM)
+        
+        Note: Preconditioner updates are currently disabled for TRM models
+        due to special forward() signature. The optimizer works like SGD.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        
+        # Update preconditioner periodically
+        # Currently disabled for TRM - see update() method
+        if (self.step_count > 0 and 
+            self.step_count % self.config.precond_update_every == 0 and
+            data_batch is not None and labels is not None and loss_fn is not None):
+            if self.step_count % (self.config.precond_update_every * 10) == 0:
+                # Only print occasionally to avoid spam
+                print(f"[LQR Note] Preconditioner updates disabled for TRM models (step {self.step_count})")
+            # Skip update for TRM compatibility
+            # self.preconditioner.update(self.model, data_batch, labels, loss_fn, self, carry)
+        
+        # Collect gradients
+        gradients = {}
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    # Get parameter name (this is tricky without name mapping)
+                    param_name = None
+                    for name, param in self.model.named_parameters():
+                        if param is p:
+                            param_name = name
+                            break
+                    
+                    if param_name:
+                        gradients[param_name] = p.grad.clone()
+        
+        # Apply preconditioner
+        precond_grads = self.preconditioner.apply(gradients)
+        
+        # Apply preconditioned gradients with SGD update
+        for group in self.param_groups:
+            momentum = group['momentum']
+            weight_decay = group['weight_decay']
+            
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                
+                # Find parameter name
+                param_name = None
+                for name, param in self.model.named_parameters():
+                    if param is p:
+                        param_name = name
+                        break
+                
+                if param_name and param_name in precond_grads:
+                    grad = precond_grads[param_name]
+                else:
+                    grad = p.grad
+                
+                # Apply weight decay
+                if weight_decay != 0:
+                    grad = grad.add(p.data, alpha=weight_decay)
+                
+                # SGD with momentum
+                if momentum != 0:
+                    state = self.state[p]
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(p.data)
+                    
+                    buf = state['momentum_buffer']
+                    buf.mul_(momentum).add_(grad)
+                    grad = buf
+                
+                # Update parameters
+                p.data.add_(grad, alpha=-group['lr'])
+        
+        self.step_count += 1
+        return loss
+
+
 # Example usage function
+def create_lqr_adam_optimizer_for_trm(model: nn.Module, config: LQRConfig) -> LQRAdamOptimizer:
+    """
+    Create LQR-inspired optimizer with Adam for TinyRecursiveModels.
+    
+    Usage in pretrain.py:
+        from lqr_trm import create_lqr_adam_optimizer_for_trm, LQRConfig
+        
+        lqr_config = LQRConfig(
+            lr=1e-4,
+            precond_lr=1e-2,
+            precond_update_every=100,
+            ema_decay=0.9
+        )
+        optimizer = create_lqr_adam_optimizer_for_trm(model, lqr_config)
+        
+        # In training loop:
+        loss.backward()
+        optimizer.step(data_batch=x, labels=y, loss_fn=criterion)
+    """
+    return LQRAdamOptimizer(model.parameters(), model, config)
+
+
+def create_lqr_sgd_optimizer_for_trm(model: nn.Module, config: LQRConfig, momentum: float = 0.9) -> LQRSGDOptimizer:
+    """
+    Create LQR-inspired optimizer with SGD for TinyRecursiveModels.
+    
+    Usage in pretrain.py:
+        from lqr_trm import create_lqr_sgd_optimizer_for_trm, LQRConfig
+        
+        lqr_config = LQRConfig(
+            lr=1e-4,
+            precond_lr=1e-2,
+            precond_update_every=100,
+            ema_decay=0.9
+        )
+        optimizer = create_lqr_sgd_optimizer_for_trm(model, lqr_config, momentum=0.9)
+        
+        # In training loop:
+        loss.backward()
+        optimizer.step(data_batch=x, labels=y, loss_fn=criterion)
+    """
+    return LQRSGDOptimizer(model.parameters(), model, config, momentum=momentum)
+
+
+# Keep backward compatibility
 def create_lqr_optimizer_for_trm(model: nn.Module, config: LQRConfig) -> LQRAdamOptimizer:
     """
     Create LQR-inspired optimizer for TinyRecursiveModels.

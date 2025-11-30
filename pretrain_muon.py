@@ -1,23 +1,3 @@
-"""
-TinyRecursiveModels Pretrain Script with LQR Optimizer
-
-This is a complete, runnable version of pretrain.py with LQR optimizer integrated.
-
-Usage:
-    # With LQR optimizer
-    uv run torchrun --nproc-per-node 4 pretrain_lqr.py \
-        arch=trm \
-        data_paths="[data/sudoku-extreme-1k-aug-1000]" \
-        use_lqr=True \
-        lqr_precond_lr=1e-2
-    
-    # Without LQR (baseline)
-    uv run torchrun --nproc-per-node 4 pretrain_lqr.py \
-        arch=trm \
-        data_paths="[data/sudoku-extreme-1k-aug-1000]" \
-        use_lqr=False
-"""
-
 from typing import Optional, Any, Sequence, List
 from dataclasses import dataclass
 import os
@@ -37,15 +17,13 @@ import coolname
 import hydra
 import pydantic
 from omegaconf import DictConfig
-from adam_atan2_pytorch import AdamAtan2 as AdamATan2
+from muon import Muon
+from adam_atan2_pytorch import AdamAtan2
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
-
-# Import LQR optimizer
-from lqr_trm import create_lqr_optimizer_for_trm, LQRConfig
 
 
 class LossConfig(pydantic.BaseModel):
@@ -78,8 +56,14 @@ class PretrainConfig(pydantic.BaseModel):
     epochs: int
 
     lr: float
+    muon_lr: float = 0.02
     lr_min_ratio: float
     lr_warmup_steps: int
+    
+    # Muon-specific LR schedule (WSD: Warmup-Stable-Decay)
+    muon_warmup_steps: Optional[int] = None  # Default: use lr_warmup_steps
+    muon_lr_min_ratio: float = 0.0  # Muon typically decays to 0
+    muon_cooldown_frac: float = 0.2  # Last 20% of training is cooldown
 
     weight_decay: float
     beta1: float
@@ -99,30 +83,19 @@ class PretrainConfig(pydantic.BaseModel):
     seed: int = 0
     checkpoint_every_eval: bool = False
     eval_interval: Optional[int] = None
-    min_eval_interval: Optional[int] = 0  # when to start eval
+    min_eval_interval: Optional[int] = 0 # when to start eval
     eval_save_outputs: List[str] = []
 
-    ema: bool = False  # use Exponential-Moving-Average
-    ema_rate: float = 0.999  # EMA-rate
-    freeze_weights: bool = False  # If True, freeze weights and only learn the embeddings
-    
-    # LQR optimizer settings
-    use_lqr: bool = False
-    lqr_precond_lr: float = 1e-2
-    lqr_precond_update_every: int = 1000 # TODO: make this higher, before 100 
-    lqr_precond_update_steps: int = 10
-    lqr_ema_decay: float = 0.6 # TODO: make this lower 0.6, before 0.9
-    lqr_damping: float = 1e-4
-    lqr_block_structure: str = "diagonal"
-    lqr_normalize_grad: bool = False # TODO: make this False, before True
-    lqr_clip_precond_min: float = 1e-8
-
+    ema: bool = False # use Exponential-Moving-Average
+    ema_rate: float = 0.999 # EMA-rate
+    freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
 
 @dataclass
 class TrainState:
     model: nn.Module
     optimizers: Sequence[torch.optim.Optimizer]
     optimizer_lrs: Sequence[float]
+    optimizer_is_muon: Sequence[bool]  # Track which optimizers are Muon
     carry: Any
 
     step: int
@@ -179,67 +152,82 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
 
-    # Optimizers and lr
-    if config.use_lqr:
-        if rank == 0:
-            print("=" * 60)
-            print("Using LQR Optimizer")
-            print("=" * 60)
-            print(f"  precond_lr: {config.lqr_precond_lr}")
-            print(f"  precond_update_every: {config.lqr_precond_update_every}")
-            print(f"  precond_update_steps: {config.lqr_precond_update_steps}")
-            print(f"  ema_decay: {config.lqr_ema_decay}")
-            print(f"  damping: {config.lqr_damping}")
-            print(f"  block_structure: {config.lqr_block_structure}")
-            print("=" * 60)
-        
-        lqr_config = LQRConfig(
-            lr=config.lr,
-            precond_lr=config.lqr_precond_lr,
-            precond_update_every=config.lqr_precond_update_every,
-            precond_update_steps=config.lqr_precond_update_steps,
-            ema_decay=config.lqr_ema_decay,
-            damping=config.lqr_damping,
-            block_structure=config.lqr_block_structure,
-            normalize_grad=config.lqr_normalize_grad,
-            clip_precond_min=config.lqr_clip_precond_min,
-            weight_decay=config.weight_decay,
-            betas=(config.beta1, config.beta2)
-        )
-        
-        if config.arch.puzzle_emb_ndim == 0:
-            print("Using LQR optimizer for puzzle embedding")
-            optimizers = [
-                create_lqr_optimizer_for_trm(model, lqr_config)
-            ]
-            optimizer_lrs = [config.lr]
-            
-        elif config.freeze_weights:
-            optimizers = [
-                CastedSparseEmbeddingSignSGD_Distributed(
-                    model.model.puzzle_emb.buffers(),  # type: ignore
-                    lr=0,
-                    weight_decay=config.puzzle_emb_weight_decay,
-                    world_size=world_size
-                )
-            ]
-            optimizer_lrs = [config.puzzle_emb_lr]
-            
-        else:
-            print("Using LQR optimizer for model parameters")
-            optimizers = [
-                CastedSparseEmbeddingSignSGD_Distributed(
-                    model.model.puzzle_emb.buffers(),  # type: ignore
-                    lr=0,
-                    weight_decay=config.puzzle_emb_weight_decay,
-                    world_size=world_size
-                ),
-                create_lqr_optimizer_for_trm(model, lqr_config)
-            ]
-            optimizer_lrs = [config.puzzle_emb_lr, config.lr]
-    
-    return model, optimizers, optimizer_lrs
 
+    def get_muon_and_adam_params(model):
+        muon_params = []
+        adam_params = []
+        
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'puzzle_emb' in name:
+                continue
+            # Use Muon for 2D+ weights in reasoning layers (L_level)
+            if param.ndim >= 2 and 'L_level' in name:
+                muon_params.append(param)
+            else:
+                adam_params.append(param)
+        
+        return muon_params, adam_params
+    
+    muon_params, adam_params = get_muon_and_adam_params(model)
+    
+    # Optimizers and lr
+    # Track which optimizers are Muon for LR scheduling
+    if config.freeze_weights:
+        # Only train puzzle embeddings
+        optimizers = [
+            CastedSparseEmbeddingSignSGD_Distributed(
+                model.model.puzzle_emb.buffers(),  # type: ignore
+                lr=0,  # Needs to be set by scheduler
+                weight_decay=config.puzzle_emb_weight_decay,
+                world_size=world_size
+            )
+        ]
+        optimizer_lrs = [config.puzzle_emb_lr]
+        optimizer_is_muon = [False]
+    elif config.arch.puzzle_emb_ndim == 0:
+        # No puzzle embeddings - use Muon + AdamAtan2
+        optimizers = [
+            Muon(
+                muon_params,
+                lr=config.muon_lr,
+                momentum=0.95,
+            ),
+            AdamAtan2(
+                adam_params,
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+                betas=(config.beta1, config.beta2)
+            )
+        ]
+        optimizer_lrs = [config.muon_lr, config.lr]
+        optimizer_is_muon = [True, False]  # Muon first, Adam second
+    else:
+        # With puzzle embeddings - use Muon + AdamAtan2 + sparse embedding optimizer
+        optimizers = [
+            CastedSparseEmbeddingSignSGD_Distributed(
+                model.model.puzzle_emb.buffers(),  # type: ignore
+                lr=0,  # Needs to be set by scheduler
+                weight_decay=config.puzzle_emb_weight_decay,
+                world_size=world_size
+            ),
+            Muon(
+                muon_params,
+                lr=config.muon_lr,
+                momentum=0.95,
+            ),
+            AdamAtan2(
+                adam_params,
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+                betas=(config.beta1, config.beta2)
+            )
+        ]
+        optimizer_lrs = [config.puzzle_emb_lr, config.muon_lr, config.lr]
+        optimizer_is_muon = [False, True, False]  # Only Muon is True
+
+    return model, optimizers, optimizer_lrs, optimizer_is_muon
 
 def mix_weights_direct(device, alpha, net, nets):
     sd = []
@@ -254,7 +242,6 @@ def mix_weights_direct(device, alpha, net, nets):
     net.load_state_dict(sd_alpha)
     return net
 
-
 def cosine_schedule_with_warmup_lr_lambda(
     current_step: int, *, base_lr: float, num_warmup_steps: int, num_training_steps: int, min_ratio: float = 0.0, num_cycles: float = 0.5
 ):
@@ -265,12 +252,48 @@ def cosine_schedule_with_warmup_lr_lambda(
     return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
 
 
+def wsd_schedule_lr_lambda(
+    current_step: int, *, base_lr: float, num_warmup_steps: int, num_training_steps: int, 
+    cooldown_frac: float = 0.2, min_ratio: float = 0.0
+):
+    """
+    WSD (Warmup-Stable-Decay) / Trapezoidal learning rate schedule.
+    Used in modded-nanogpt for Muon optimizer.
+    
+    Schedule:
+    1. Warmup: Linear ramp from 0 to base_lr
+    2. Stable: Constant at base_lr  
+    3. Cooldown: Cosine decay from base_lr to base_lr * min_ratio
+    
+    Args:
+        current_step: Current training step
+        base_lr: Peak learning rate
+        num_warmup_steps: Steps for linear warmup
+        num_training_steps: Total training steps
+        cooldown_frac: Fraction of training for cooldown (e.g., 0.2 = last 20%)
+        min_ratio: Minimum LR as fraction of base_lr (0.0 = decay to zero)
+    """
+    cooldown_steps = int(num_training_steps * cooldown_frac)
+    cooldown_start = num_training_steps - cooldown_steps
+    
+    if current_step < num_warmup_steps:
+        # Linear warmup
+        return base_lr * float(current_step) / float(max(1, num_warmup_steps))
+    elif current_step < cooldown_start:
+        # Stable phase - constant LR
+        return base_lr
+    else:
+        # Cooldown phase - cosine decay
+        progress = float(current_step - cooldown_start) / float(max(1, cooldown_steps))
+        return base_lr * (min_ratio + (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+
 def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
     # Estimated total training steps
     total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
 
     # Model
-    model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size)
+    model, optimizers, optimizer_lrs, optimizer_is_muon = create_model(config, train_metadata, rank=rank, world_size=world_size)
 
     return TrainState(
         step=0,
@@ -279,6 +302,7 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
         model=model,
         optimizers=optimizers,
         optimizer_lrs=optimizer_lrs,
+        optimizer_is_muon=optimizer_is_muon,
         carry=None
     )
 
@@ -313,14 +337,36 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
         model.load_state_dict(state_dict, assign=True)
 
 
-def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
-    return cosine_schedule_with_warmup_lr_lambda(
-        current_step=train_state.step,
-        base_lr=base_lr,
-        num_warmup_steps=round(config.lr_warmup_steps),
-        num_training_steps=train_state.total_steps,
-        min_ratio=config.lr_min_ratio
-    )
+def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState, is_muon: bool = False):
+    """Compute learning rate for current step.
+    
+    Args:
+        base_lr: Base learning rate for this optimizer
+        config: Training config
+        train_state: Current training state
+        is_muon: If True, use WSD schedule for Muon optimizer
+    """
+    if is_muon:
+        # Use WSD (Warmup-Stable-Decay) schedule for Muon
+        warmup_steps = config.muon_warmup_steps if config.muon_warmup_steps is not None else config.lr_warmup_steps
+        return wsd_schedule_lr_lambda(
+            current_step=train_state.step,
+            base_lr=base_lr,
+            num_warmup_steps=round(warmup_steps),
+            num_training_steps=train_state.total_steps,
+            cooldown_frac=config.muon_cooldown_frac,
+            min_ratio=config.muon_lr_min_ratio
+        )
+    else:
+        # Use cosine schedule with warmup for Adam/other optimizers
+        return cosine_schedule_with_warmup_lr_lambda(
+            current_step=train_state.step,
+            base_lr=base_lr,
+            num_warmup_steps=round(config.lr_warmup_steps),
+            num_training_steps=train_state.total_steps,
+            min_ratio=config.lr_min_ratio
+        )
+
 
 
 def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetadata) -> List[Any]:
@@ -335,7 +381,6 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
             evaluators.append(cls)
 
     return evaluators
-
 
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
     train_state.step += 1
@@ -361,39 +406,22 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             if param.grad is not None:
                 dist.all_reduce(param.grad)
             
-    # Apply optimizer
-    lr_this_step = None    
-    for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
-        lr_this_step = compute_lr(base_lr, config, train_state)
+    # Apply optimizer with appropriate LR schedule
+    lr_adam = None
+    lr_muon = None
+    for optim, base_lr, is_muon in zip(train_state.optimizers, train_state.optimizer_lrs, train_state.optimizer_is_muon):
+        lr_this_step = compute_lr(base_lr, config, train_state, is_muon=is_muon)
 
         for param_group in optim.param_groups:
             param_group['lr'] = lr_this_step
         
-        # If using LQR optimizer, pass data for preconditioner update
-        if config.use_lqr and hasattr(optim, 'preconditioner'):
-            # Create simple loss function for preconditioner
-            def loss_fn(outputs, targets):
-                # Simplified loss for preconditioner update
-                # Note: This is a proxy, you may want to use the actual loss from the model
-                return nn.functional.cross_entropy(outputs.view(-1, outputs.size(-1)), targets.view(-1))
-            
-            # Get inputs/targets from batch for preconditioner
-            # Adjust these based on your actual batch structure
-            inputs = batch.get('inputs', batch.get('input_ids', None))
-            targets = batch.get('labels', batch.get('targets', None))
-            
-            if inputs is not None and targets is not None:
-                optim.step(
-                    data_batch=inputs,
-                    labels=targets,
-                    loss_fn=loss_fn
-                )
-            else:
-                # Fallback to regular step if batch structure doesn't match
-                optim.step()
+        # Track LRs for logging
+        if is_muon:
+            lr_muon = lr_this_step
         else:
-            optim.step()
+            lr_adam = lr_this_step
             
+        optim.step()
         optim.zero_grad()
 
     # Reduce metrics
@@ -414,9 +442,14 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             count = max(reduced_metrics["count"], 1)  # Avoid NaNs
             reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
 
-            reduced_metrics["train/lr"] = lr_this_step
+            # Log learning rates
+            if lr_adam is not None:
+                reduced_metrics["train/lr_adam"] = lr_adam
+            if lr_muon is not None:
+                reduced_metrics["train/lr_muon"] = lr_muon
+            # Keep backward compatibility with single lr metric
+            reduced_metrics["train/lr"] = lr_adam if lr_adam is not None else lr_muon
             return reduced_metrics
-
 
 def evaluate(
     config: PretrainConfig,
@@ -561,7 +594,6 @@ def evaluate(
 
     return reduced_metrics
 
-
 def save_code_and_config(config: PretrainConfig):
     if config.checkpoint_path is None or wandb.run is None:
         return
@@ -597,8 +629,7 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
         if config.project_name is None:
             config.project_name = f"{os.path.basename(config.data_paths[0]).capitalize()}-ACT-torch"
         if config.run_name is None:
-            suffix = "LQR" if config.use_lqr else "baseline"
-            config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)} ({suffix})"
+            config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)}"
         if config.checkpoint_path is None:
             config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
 
@@ -730,4 +761,3 @@ def launch(hydra_config: DictConfig):
 
 if __name__ == "__main__":
     launch()
-
